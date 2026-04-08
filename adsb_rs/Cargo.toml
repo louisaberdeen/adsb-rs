@@ -1,0 +1,30 @@
+[package]
+name = "adsb_rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Fast bounded/unbounded queues between pipeline threads (MPMC)
+crossbeam-channel = "0.5"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Complex number type for SoapySDR stream buffers
+num-complex = "0.4"
+
+[dependencies.soapysdr]
+# SoapySDR hardware interface — supports RTL-SDR, HackRF, USRP, LimeSDR, etc.
+# Requires libsoapysdr-dev + the relevant SDR driver installed
+# Usage: cargo build --features sdr
+version = "0.5"
+optional = true
+
+[features]
+default = []
+sdr = ["dep:soapysdr"]
+
+[[bin]]
+name = "adsb_rs"
+path = "src/main.rs"
