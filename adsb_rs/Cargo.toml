@@ -7,6 +7,13 @@ edition = "2021"
 # Fast bounded/unbounded queues between pipeline threads (MPMC)
 crossbeam-channel = "0.5"
 
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# JSON serialisation for aircraft.json output
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # Logging
 log = "0.4"
 env_logger = "0.11"

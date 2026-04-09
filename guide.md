@@ -505,3 +505,387 @@ The `icao_filter` accumulates across decoded messages. If you parallelize decodi
 `spiral_from` is a no-alloc iterator in Rust — implement it as a struct with `Iterator` that yields the same sequence.
 
 The `modes_checksum` inner loop is 8 iterations per byte, 11–14 bytes per message — around 100 iterations total. In Rust this is trivially fast; no CRC crate needed.
+
+---
+
+## Part 7: From Hex to Aircraft Map — Parsing DF17 Payloads
+
+Up to this point the decoder produces a stream of validated hex strings. That's useful for raw monitoring, but a map needs to know *where* an aircraft is, *how fast* it's going, and *what it's called*. All of that information is in the ME field of DF17 Extended Squitter messages, encoded in a compact binary format defined by ICAO Annex 10. This part walks through how each field is extracted and why the format is designed the way it is.
+
+---
+
+### The DF17 Message Structure
+
+A 112-bit (14-byte) DF17 message is laid out as:
+
+```
+Byte  0       1       2       3       4       5       6       7       8       9      10      11      12      13
+      [DF+CA ][  ICAO address (3 bytes)              ][  ME field (7 bytes)                        ][  CRC-24 (3 bytes)     ]
+      76543210
+      DF = bits 7-3 (5 bits) = 17 for Extended Squitter
+      CA = bits 2-0 (3 bits) = capability
+```
+
+- **DF (Downlink Format, 5 bits):** always 17 for ADS-B. This is the value the decoder checked when deciding message length.
+- **CA (Capability, 3 bits):** flight status and interrogator capability. Not decoded by this project.
+- **ICAO (24 bits, bytes 1–3):** the unique aircraft address, the same one the ICAO filter has already extracted.
+- **ME (56 bits, bytes 4–10):** the payload. Everything interesting lives here.
+- **CRC-24 (bytes 11–13):** must equal zero for a valid DF17 — already verified before this point.
+
+The first 5 bits of the ME field are the **Type Code (TC)**, which determines what the remaining 51 bits contain:
+
+| TC | Content |
+|---|---|
+| 1–4 | Aircraft identification (callsign) |
+| 5–8 | Surface position |
+| 9–18 | Airborne position with barometric altitude |
+| 19 | Airborne velocity |
+| 20–22 | Airborne position with GNSS altitude |
+
+This decoder handles TC 1–4, 9–18, and 19 — callsign, baro position, and velocity. Surface position and GNSS altitude are structurally similar but not implemented.
+
+---
+
+### TC 1–4: Callsign
+
+The callsign is 8 characters packed at 6 bits each into the 48 bits following the Type Code (50 bits total with the 5-bit TC, leaving 1 bit unused but that's fine). Why 6 bits per character? The AIS (Aeronautical Information Services) character set has exactly 64 members — A-Z (26), 0-9 (10), space, and some punctuation — which fits in 6 bits.
+
+The 6-bit encoding maps:
+
+```
+1–26  →  A–Z
+32    →  space
+48–57 →  0–9
+```
+
+Value 0 is not a valid character; values 27–31 and 33–47 are technically reserved. In practice, the only characters you'll see in an ICAO callsign are A–Z, 0–9, and trailing spaces.
+
+Extracting the characters from the ME bytes:
+
+```rust
+// ME bytes are indexed from byte 0 of the ME field
+// TC occupies bits 0-4. Characters start at bit 5.
+let chars: Vec<char> = (0..8).map(|i| {
+    // Bit offset of this character from the start of ME
+    let bit_start = 5 + i * 6;
+    let byte_idx  = bit_start / 8;
+    let bit_off   = bit_start % 8;
+    // Extract 6 bits, potentially spanning two bytes
+    let val = ((me_u64 >> (48 - bit_start)) & 0x3F) as u8;
+    match val {
+        1..=26 => (b'A' + val - 1) as char,
+        48..=57 => (b'0' + val - 48) as char,
+        32      => ' ',
+        _       => '?',
+    }
+}).collect();
+```
+
+The trick with `me_u64`: packing all 7 ME bytes into a single `u64` (with the MSB zero) means any 6-bit field can be extracted by a single right-shift and mask without worrying about byte boundaries. This is the same trick used for altitude and CPR extraction — it's cleaner than manual byte indexing.
+
+Callsigns are 8 characters, almost always padded with trailing spaces (`"RYR1234 "`). The state tracker trims them before storing (`trim_end()`), since tar1090 displays them with a trailing space in its tooltip anyway.
+
+---
+
+### TC 9–18: Airborne Position
+
+This type code encodes two completely different things in the same 7-byte field: altitude and position. The position encoding (CPR) is detailed enough to deserve its own section.
+
+#### The ME Field Layout for TC 9–18
+
+```
+Bit offsets within ME (0 = MSB of ME byte 0):
+  0– 4:  Type Code TC (5 bits)
+  5– 6:  Surveillance status (2 bits, ignored)
+  7:     Single antenna flag (1 bit, ignored)
+  8–19:  Altitude (12 bits)
+  20:    Time synchronisation flag (1 bit, ignored)
+  21:    F-flag — 0 = even frame, 1 = odd frame (1 bit)
+  22–38: CPR latitude (17 bits)
+  39–55: CPR longitude (17 bits)
+```
+
+Total: 56 bits = 7 bytes. The bit numbering is big-endian; bit 0 is the most significant.
+
+Packing all 7 ME bytes into a `u64` and extracting by absolute bit position avoids any ambiguity about which byte a field lives in:
+
+```rust
+let me_u64 = u64::from_be_bytes([0, me[0], me[1], me[2], me[3], me[4], me[5], me[6]]);
+
+// Altitude occupies bits 8-19 from the top → shift right by (55-19)=36, mask 12 bits
+let alt_raw = ((me_u64 >> 36) & 0xFFF) as u32;
+
+// F-flag is bit 21 → shift right by (55-21)=34
+let f_bit = ((me_u64 >> 34) & 1) != 0;
+
+// CPR latitude occupies bits 22-38 → shift right by (55-38)=17, mask 17 bits
+let lat17 = ((me_u64 >> 17) & 0x1FFFF) as u32;
+
+// CPR longitude occupies bits 39-55 → no shift needed, mask 17 bits
+let lon17 = (me_u64 & 0x1FFFF) as u32;
+```
+
+The right-shift amounts come directly from the bit layout: to extract a field whose MSB is at bit position `p` (0 = top of the 56-bit ME field), the u64 has 8 leading zero bits, so the shift is `(63 - p - field_width + 1)` = `(56 - p - 1)` for the MSB, or equivalently shift by `(55 - LSB_position)`. Counting from the bottom: longitude MSB is at position 55 − 39 = 16, so mask 17 bits starting at bit 16 → `>> 0 & 0x1FFFF`. Latitude MSB at 55 − 22 = 33, so `>> 17 & 0x1FFFF`. This is the mechanical translation from bit-layout diagram to Rust shifts.
+
+#### Altitude Decoding
+
+The 12-bit altitude field uses the Q-bit (bit 4 within the 12-bit field, counting from LSB) to select between two encodings:
+
+**Q-bit = 1 (the common case):** The remaining 11 bits (5 high bits + 6 low bits around the Q-bit) encode altitude directly:
+
+```rust
+let q_bit = (alt_raw >> 4) & 1;
+if q_bit == 1 {
+    // Remove the Q-bit: bits above it shift right by 1
+    let n = ((alt_raw & 0xFE0) >> 1) | (alt_raw & 0x00F);
+    // n=0 means "altitude not available"
+    if n == 0 { return None; }
+    altitude_feet = n as i32 * 25 - 1000
+}
+```
+
+The formula `n * 25 - 1000` gives altitude in feet MSL. The − 1000 offset means the encoding can represent altitudes below sea level (n=1 → −975 ft). The 25-foot resolution is coarser than GPS but fine for ATC purposes.
+
+**Q-bit = 0:** Gillham encoding (a Gray-code variant). Used at very high altitudes and in older transponders. This decoder returns `None` for Q-bit=0 — it's uncommon and the Gillham decode adds significant complexity for minimal benefit.
+
+---
+
+### CPR: Compact Position Reporting
+
+CPR is the most algorithmically interesting part of ADS-B decoding. The 17 CPR latitude bits and 17 CPR longitude bits are **not** simply a scaled latitude and longitude — they encode a fractional position within a *zone*, and the zone identity is ambiguous from a single frame. Two consecutive frames (one even, one odd) together resolve the ambiguity and give a precise global position.
+
+#### Why Two Frames?
+
+17 bits can encode 2¹⁷ = 131,072 distinct values, giving a resolution of 360°/131,072 ≈ 0.00274° ≈ 0.3 km per tick — fine enough. But to avoid transmitting two separate 17-bit numbers (lat + lon), CPR encodes position as a fraction within a latitude zone, and alternates between two different zone sizes. The zone size difference is what breaks the ambiguity.
+
+Concretely:
+- **Even frames** (F=0): divide the globe into 60 latitude bands of 6° each.
+- **Odd frames** (F=1): divide the globe into 59 latitude bands of ≈ 6.10° each.
+
+A single frame tells you *where within a zone* the aircraft is, but not *which zone*. Two frames with different zone counts let you solve for both the zone and the position within it. The 60-vs-59 difference means the system of equations has a unique solution within a region small enough to be unambiguous in practice (within about 360° / gcd(60,59) = 360° — so theoretically not unique globally, but the aircraft's position from its first fix resolves the remaining ambiguity).
+
+#### The Global Decode Algorithm
+
+Given a recent even frame `(lat_e, lon_e)` and odd frame `(lat_o, lon_o)`, all as 17-bit unsigned integers in [0, 131071]:
+
+**Step 1 — Latitude zone index:**
+
+```
+j = floor(59 × lat_e/131072 − 60 × lat_o/131072 + 0.5)
+```
+
+This estimates which zone pair the aircraft is in. The floor-plus-half is standard rounding to the nearest integer.
+
+**Step 2 — Decoded latitudes:**
+
+```rust
+let dlat_e = 360.0 / 60.0;   // = 6.0°
+let dlat_o = 360.0 / 59.0;   // ≈ 6.1017°
+
+let lat_e_deg = dlat_e * (j.rem_euclid(60) as f64 + lat_e as f64 / 131072.0);
+let lat_o_deg = dlat_o * (j.rem_euclid(59) as f64 + lat_o as f64 / 131072.0);
+```
+
+The `rem_euclid(60/59)` keeps the zone index in-range regardless of the sign of `j`. The fractional part `lat_e / 131072.0` is the aircraft's position *within* that zone.
+
+**Step 3 — Latitude consistency check:**
+
+The two computed latitudes should agree closely. If `|lat_e_deg − lat_o_deg| > 3°` (half a zone), the frames are from different zones and the decode is invalid. Discard and wait for the next pair.
+
+**Step 4 — Select latitude by frame age:**
+
+Use whichever frame arrived more recently. If the even frame is newer, use `lat_e_deg`; if odd is newer, use `lat_o_deg`.
+
+**Step 5 — Longitude zone count:**
+
+```rust
+let nl_e = nl(lat_e_deg);
+let nl_o = nl(lat_o_deg);
+if nl_e != nl_o { return None; }   // frames span a zone boundary — discard
+```
+
+`nl(lat)` returns the number of longitude zones at a given latitude, ranging from 59 at the equator to 1 at the poles. It uses the ICAO Annex 10 Appendix B table — a series of latitude thresholds, each marking where the zone count decreases by one as you move towards the pole. The table has 58 entries; see the Bug Record section at the end of this document for what happens when the table is wrong.
+
+**Step 6 — Longitude zone index:**
+
+```
+m = floor(lon_e/131072 × (nl_e − 1) − lon_o/131072 × nl_e + 0.5)
+```
+
+Same structure as Step 1 but for longitude.
+
+**Step 7 — Decoded longitude:**
+
+```rust
+let ni = if even_newer { nl_e.max(1) } else { (nl_o - 1).max(1) };
+let dlon = 360.0 / ni as f64;
+let lon_deg = dlon * (m.rem_euclid(ni as i64) as f64 + lon_ref as f64 / 131072.0);
+```
+
+Where `lon_ref` is the CPR longitude from whichever frame is newer.
+
+**Step 8 — Normalise:**
+
+Wrap latitude into [−90, 90] and longitude into [−180, 180]. Subtract 360° if the value exceeds half the range.
+
+#### The 10-Second Window
+
+A position is only decoded if the even and odd frames are less than 10 seconds apart. If the aircraft is manoeuvring, older frames from a different location would produce a nonsense position. The 10-second limit is conservative (at 900 km/h a plane moves only ~2.5 km in 10 seconds, well within the ~180 km zone width at mid-latitudes) but generous enough that a brief signal dropout doesn't force a cold start.
+
+---
+
+### TC 19: Velocity
+
+Velocity is the simplest decode — no zone arithmetic, just direct measurement.
+
+The ME field for TC 19, Subtype 1 or 2 (ground speed, the common case):
+
+```
+Bits  5– 7:  Subtype (3 bits), 1 = subsonic, 2 = supersonic
+Bit   8:     Intent change flag
+Bit   9:     IFR capability flag
+Bits 10–12:  NACv (navigation accuracy, ignored)
+Bit  13:     East-West direction (0 = east, 1 = west)
+Bits 14–23:  East-West speed (10 bits, knots+1; 0 = not available)
+Bit  24:     North-South direction (0 = north, 1 = south)
+Bits 25–34:  North-South speed (10 bits, knots+1; 0 = not available)
+Bit  35:     Vertical rate source (0 = baro, 1 = GNSS)
+Bit  36:     Vertical rate sign (0 = up, 1 = down)
+Bits 37–45:  Vertical rate magnitude (9 bits, 64 fpm increments + 1)
+Bits 46–47:  Reserved
+Bit  48:     GNSS/baro altitude difference sign
+Bits 49–55:  GNSS/baro altitude difference (7 bits, 25 ft increments)
+```
+
+The `knots + 1` encoding means a value of 1 = 0 kt, 2 = 1 kt, etc., and 0 is the "not available" sentinel. Subtract 1 before using.
+
+Converting EW/NS components to ground speed and track:
+
+```rust
+let vew = if ew_dir { -(ew_spd as f64) } else { ew_spd as f64 };  // west = negative
+let vns = if ns_dir { -(ns_spd as f64) } else { ns_spd as f64 };  // south = negative
+
+let gs    = (vew * vew + vns * vns).sqrt();                         // knots
+let track = vew.atan2(vns).to_degrees().rem_euclid(360.0);         // 0 = north, clockwise
+```
+
+`atan2(vew, vns)` with the E-W component as the *first* argument is the correct convention for bearing (as opposed to standard mathematical angle, which measures from the east axis). `rem_euclid(360.0)` normalises negative angles.
+
+Vertical rate: `(vr_raw - 1) * 64` feet per minute, negated if the sign bit is set. The `- 1` removes the same availability sentinel offset.
+
+---
+
+### The State Tracker
+
+Individual messages are snapshots. A callsign comes in one message, a position in the next, velocity in another. The state tracker is the glue — it maintains a `HashMap<u32, AircraftState>` keyed by ICAO address and merges each new message into the appropriate record.
+
+```rust
+struct AircraftState {
+    callsign:     Option<String>,
+    alt_baro:     Option<i32>,          // feet MSL
+    lat:          Option<f64>,
+    lon:          Option<f64>,
+    gs:           Option<f64>,          // ground speed, knots
+    track:        Option<f64>,          // degrees, 0 = north, clockwise
+    baro_rate:    Option<i32>,          // feet per minute, negative = descending
+    cpr_even:     Option<(u32, u32)>,   // (lat17, lon17) from the most recent even frame
+    cpr_odd:      Option<(u32, u32)>,   // (lat17, lon17) from the most recent odd frame
+    last_even_ts: Option<Instant>,
+    last_odd_ts:  Option<Instant>,
+    last_seen:    Instant,
+    msg_count:    u32,
+}
+```
+
+On each incoming DF17 message the tracker:
+1. Looks up (or creates) the `AircraftState` for the message's ICAO address.
+2. Updates `last_seen` and increments `msg_count`.
+3. Dispatches on TC:
+   - TC 1–4 → update `callsign`
+   - TC 9–18 → update `alt_baro`, store the CPR frame, attempt a position decode
+   - TC 19 → update `gs`, `track`, `baro_rate`
+
+CPR position is attempted whenever both `last_even_ts` and `last_odd_ts` are set and the older one is less than 10 seconds old. If successful, `lat` and `lon` are updated. If the decode fails (inconsistent frames, zone boundary straddle), the frames are kept in case the next message completes a valid pair.
+
+#### Purging
+
+Every write cycle the tracker removes aircraft whose `last_seen` is more than 60 seconds ago. Without purging, aircraft that fly out of range stay in the JSON indefinitely, creating a ghost-filled map. 60 seconds is long enough to survive a brief signal dropout while short enough to clear aircraft that have genuinely left the area.
+
+---
+
+### Writing aircraft.json
+
+tar1090 polls `aircraft.json` from a configured directory every ~8 seconds. The file format is a JSON object:
+
+```json
+{
+  "now":      1712345678.912,
+  "messages": 1547,
+  "aircraft": [
+    {
+      "hex":      "4ca7ed",
+      "flight":   "AMC421  ",
+      "lat":      35.8792,
+      "lon":      14.4731,
+      "alt_baro": 1050,
+      "gs":       148.3,
+      "track":    272.1,
+      "baro_rate": -768,
+      "seen":     0.4,
+      "seen_pos": 0.4,
+      "messages": 38
+    }
+  ]
+}
+```
+
+Field semantics:
+- `now`: Unix timestamp (seconds, float) when the file was written.
+- `messages`: cumulative total messages decoded across all aircraft since startup.
+- `hex`: ICAO address, 6 lowercase hex digits, no `0x` prefix.
+- `flight`: callsign, 8 characters including trailing spaces. tar1090 strips them in the UI.
+- `lat`/`lon`: decimal degrees, 6 decimal places (≈ 0.1 m resolution — more than adequate for ADS-B accuracy).
+- `alt_baro`: barometric altitude, feet MSL. Integer.
+- `gs`: ground speed, knots.
+- `track`: heading, degrees clockwise from north.
+- `baro_rate`: vertical rate, feet per minute. Negative means descending. tar1090 uses this to draw the climb/descent indicator on the aircraft label.
+- `seen`: seconds since any message received. tar1090 uses this to fade old icons.
+- `seen_pos`: seconds since the last position update specifically. A plane may have recent speed data but a stale position if it stopped transmitting TC 9–18.
+- `messages`: per-aircraft message count. tar1090 uses this as a proxy for signal quality.
+
+Fields with `None` values (no data yet for this aircraft) are simply omitted from the JSON. tar1090 handles missing fields gracefully — an aircraft with a position but no callsign still appears on the map.
+
+The file is written atomically: first to `aircraft.json.tmp`, then renamed to `aircraft.json`. This is the standard POSIX atomic write pattern — a rename is atomic on Linux, so tar1090 can never read a partially-written file. Without this, a slow write could give tar1090 truncated JSON, crashing its parser and blanking the map.
+
+The write happens every 1 second from a 1 Hz timer inside the state tracker thread. For file input (not live SDR), a final write is issued after the decoder finishes processing the file, ensuring the map updates even if the file is shorter than 1 second of data.
+
+---
+
+## Bug Record: NL Table Off-By-One (CPR Longitude Error)
+
+**Symptom:** Decoded aircraft positions were consistently ~2 nm west of their true position. Latitude was accurate; only longitude was wrong. The offset was stable (not random), which ruled out bit-extraction errors and pointed to a systematic zone-count error.
+
+**Root cause:** The NL lookup table was constructed with incorrect values — each entry stored the NL value for the *current* latitude band rather than the *next* band. This meant `nl(lat)` returned `NL - 1` for every latitude, shifting the longitude zone count by one.
+
+For example, at lat 37°N (near Malta):
+- Correct `nl()`: **47** zones
+- Buggy `nl()`: **46** zones
+
+The longitude decode uses `ni = nl_val - (0 or 1)` as the number of longitude zones, and `dlon = 360 / ni`. With `ni = 46` instead of 47, each zone is ~0.30° wide instead of ~0.29°, accumulating into a ~0.3° (~18 nm at that latitude) maximum error, reduced by the fractional CPR offset to ~2 nm in practice.
+
+**Why latitude was unaffected:** CPR latitude uses fixed zone counts (60 even, 59 odd) hardcoded in the algorithm — they don't go through `nl()`. Only longitude uses `nl()`.
+
+**The fix:** Replace the lookup table with an explicit `if-else` chain matching the ICAO Annex 10 Appendix B thresholds exactly, as used by dump1090 and readsb. The table approach is error-prone because the threshold for zone N is the latitude *above which* you enter zone N-1, not zone N — easy to misread.
+
+```rust
+// Correct: threshold is the lower bound of the *next* (smaller) NL value
+fn nl(lat: f64) -> u32 {
+    let lat = lat.abs();
+    if lat < 10.47047130 { return 59; }
+    if lat < 14.82817437 { return 58; }
+    // ... etc
+    1
+}
+```
+
+**Lesson:** When implementing CPR, validate `nl()` against the reference table in dump1090's `cpr.c` before doing anything else. A unit test asserting `nl(51.5) == 36` (London) and `nl(0.0) == 59` (equator) would have caught this immediately.
