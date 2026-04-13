@@ -2,6 +2,24 @@
 
 Rust ADS-B decoder built from scratch. Reads UC8 IQ samples from any SoapySDR-compatible SDR or a binary file and outputs Mode S hex messages. Can write `aircraft.json` directly for tar1090 — no readsb required.
 
+![Decoding ADS-B packets to hex](images/decoding-hex-packets.gif)
+
+![Aircraft map in tar1090](images/tar1090-aircraft-map.png)
+
+## Install
+
+```bash
+# File decoding only
+cargo install --path adsb_rs
+
+# With live SDR support (requires libsoapysdr-dev)
+sudo apt install libsoapysdr-dev
+cargo install --path adsb_rs --features sdr
+
+# Uninstall
+cargo uninstall adsb_rs
+```
+
 ## Build
 
 All commands from the project root (`~/Documents/ADS-B/`).
@@ -76,6 +94,9 @@ tar1090 reads `aircraft.json` from a directory. `adsb_rs --json` writes that fil
 ```bash
 # Install tar1090 (points it at the directory adsb_rs writes to)
 sudo bash -c "$(curl -L https://github.com/wiedehopf/tar1090/raw/master/install.sh)" -- /tmp/adsb_json
+
+# Make dir for json to go 
+mkdir -p /tmp/adsb_json
 
 # Run decoder
 adsb_rs --live --json /tmp/adsb_json
