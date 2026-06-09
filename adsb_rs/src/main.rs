@@ -68,6 +68,10 @@ struct Cli {
     #[arg(long, value_name = "PORT")]
     serve: Option<u16>,
 
+    /// Address to bind the AVR server to (use 0.0.0.0 to expose on all interfaces)
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1")]
+    bind: String,
+
     /// Write aircraft.json to DIR every second for tar1090 (no readsb required)
     #[arg(long, value_name = "DIR")]
     json: Option<String>,
@@ -91,6 +95,7 @@ pub struct ADSBConfig {
     realtime:         bool,
     file_path:        String,
     serve_port:       Option<u16>,
+    serve_bind:       String,
     loop_file:        bool,
     json_dir:         Option<String>,
     quiet:            bool,
@@ -111,6 +116,7 @@ impl Default for ADSBConfig {
             realtime:         true,
             file_path:        String::new(),
             serve_port:       None,
+            serve_bind:       "127.0.0.1".to_string(),
             loop_file:        false,
             json_dir:         None,
             quiet:            false,
@@ -526,6 +532,7 @@ fn main() {
         realtime:         cli.live,
         file_path:        cli.file.unwrap_or_default(),
         serve_port:       cli.serve,
+        serve_bind:       cli.bind,
         loop_file:        cli.r#loop,
         json_dir:         cli.json,
         quiet:            cli.quiet,
@@ -536,13 +543,23 @@ fn main() {
     let clients: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
 
     if let Some(port) = config.serve_port {
+        const MAX_CLIENTS: usize = 64;
         let clients_accept = Arc::clone(&clients);
+        let bind_addr      = config.serve_bind.clone();
         thread::spawn(move || {
-            let listener = TcpListener::bind(("0.0.0.0", port))
-                .unwrap_or_else(|e| { eprintln!("AVR server bind failed: {e}"); std::process::exit(1) });
-            eprintln!("AVR server listening on port {port} (connect readsb with --net-connector localhost,{port},raw_in)");
+            let listener = TcpListener::bind((bind_addr.as_str(), port))
+                .unwrap_or_else(|e| { eprintln!("AVR server bind failed on {bind_addr}:{port}: {e}"); std::process::exit(1) });
+            eprintln!("AVR server listening on {bind_addr}:{port} (connect readsb with --net-connector localhost,{port},raw_in)");
             for stream in listener.incoming().flatten() {
-                clients_accept.lock().unwrap().push(stream);
+                // A client that stops reading must not stall the output thread:
+                // bound how long a broadcast write may block before we drop it
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                let mut list = clients_accept.lock().unwrap();
+                if list.len() >= MAX_CLIENTS {
+                    eprintln!("AVR server: refusing connection, {MAX_CLIENTS} clients already connected");
+                    continue; // stream dropped → connection closed
+                }
+                list.push(stream);
             }
         });
     }
