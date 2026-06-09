@@ -133,9 +133,16 @@ fn read_file(
 
     let mut chunk      = vec![0u8;  config.chunk_size];
     let mut magnitudes = vec![0u16; config.chunk_size / 2];
+    // A short read can return an odd byte count; carry the dangling I byte
+    // so I/Q pairing stays aligned across reads.
+    let mut leftover: Option<u8> = None;
 
     loop {
-        let n = reader.read(&mut chunk)?;
+        let offset = match leftover.take() {
+            Some(b) => { chunk[0] = b; 1 }
+            None    => 0,
+        };
+        let n = reader.read(&mut chunk[offset..])?;
         if n == 0 {
             if config.loop_file {
                 reader.seek(io::SeekFrom::Start(0))?;
@@ -144,14 +151,19 @@ fn read_file(
             break;
         }
 
-        for (idx, pair) in chunk[..n].chunks_exact(2).enumerate() {
+        let total = offset + n;
+        if total % 2 == 1 {
+            leftover = Some(chunk[total - 1]);
+        }
+
+        for (idx, pair) in chunk[..total].chunks_exact(2).enumerate() {
             let i     = (pair[0] as f32 - 127.5) / 127.5;
             let q     = (pair[1] as f32 - 127.5) / 127.5;
             let magsq = (i * i + q * q).min(1.0);
-            magnitudes[idx] = (magsq * 65535.0 + 0.5) as u16;
+            magnitudes[idx] = (magsq.sqrt() * 65535.0 + 0.5) as u16;
         }
         if tx
-            .send(SampleChunk { data: magnitudes[..n / 2].to_vec() })
+            .send(SampleChunk { data: magnitudes[..total / 2].to_vec() })
             .is_err()
         {
             break;
@@ -201,7 +213,7 @@ fn soapy_streaming(config: Arc<ADSBConfig>, tx: crossbeam_channel::Sender<Sample
         };
         for (idx, s) in iq_buf[..n].iter().enumerate() {
             let magsq = (s.re * s.re + s.im * s.im).min(1.0);
-            magnitudes[idx] = (magsq * 65535.0 + 0.5) as u16;
+            magnitudes[idx] = (magsq.sqrt() * 65535.0 + 0.5) as u16;
         }
         if tx
             .send(SampleChunk { data: magnitudes[..n].to_vec() })
@@ -339,9 +351,8 @@ fn preamble_detection(
             i += 1;
         }
 
-        work_buf.copy_within(tail_start..n_total, 0);
-
-        // Flush remaining NMS window at chunk boundary
+        // Flush remaining NMS window before the tail copy below overwrites
+        // the front of work_buf (win_i indexes into the pre-copy layout)
         if config.use_nms {
             if let Some(prev_i) = win_i {
                 if tx
@@ -355,6 +366,8 @@ fn preamble_detection(
                 }
             }
         }
+
+        work_buf.copy_within(tail_start..n_total, 0);
     }
 }
 
