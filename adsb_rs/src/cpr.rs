@@ -101,6 +101,11 @@ pub fn cpr_global_decode(
     let mut rlat_o = dlat_o * (j.rem_euclid(59) as f64 + lat_o);
     if rlat_e >= 270.0 { rlat_e -= 360.0; }
     if rlat_o >= 270.0 { rlat_o -= 360.0; }
+    // Corrupted frame pairs can yield latitudes in (90, 270) that still agree
+    // on NL; reject anything outside the valid range (as readsb does)
+    if !(-90.0..=90.0).contains(&rlat_e) || !(-90.0..=90.0).contains(&rlat_o) {
+        return None;
+    }
     if nl(rlat_e) != nl(rlat_o) { return None; }
 
     let nl_val   = nl(rlat_e);

@@ -166,7 +166,11 @@ pub fn state_tracker(
                 let now = Instant::now();
                 let df  = msg.bytes[0] >> 3;
 
-                if df == 17 || df == 18 {
+                // DF18 carries an ADS-B-formatted ME only for CF 0/1 (non-transponder
+                // ES) and CF 6 (rebroadcast); other CF values are TIS-B formats.
+                let is_adsb = df == 17
+                    || (df == 18 && matches!(msg.bytes[0] & 0x07, 0 | 1 | 6));
+                if is_adsb {
                     let icao = (msg.bytes[1] as u32) << 16
                              | (msg.bytes[2] as u32) <<  8
                              |  msg.bytes[3] as u32;
@@ -183,7 +187,11 @@ pub fn state_tracker(
                             if !cs.is_empty() { s.callsign = Some(cs); }
                         }
                         9..=18 => {
-                            s.altitude_baro = decode_altitude(me);
+                            // Keep the last good altitude if this frame's is
+                            // undecodable (e.g. Gillham-coded, Q=0)
+                            if let Some(alt) = decode_altitude(me) {
+                                s.altitude_baro = Some(alt);
+                            }
                             let (is_odd, lat17, lon17) = decode_cpr(me);
                             let frame = CprFrame { lat17, lon17, received_at: now };
                             if is_odd { s.cpr_odd  = Some(frame); }
@@ -198,7 +206,9 @@ pub fn state_tracker(
                             }
                         }
                         20..=22 => {
-                            s.altitude_geom = decode_altitude(me);
+                            if let Some(alt) = decode_altitude(me) {
+                                s.altitude_geom = Some(alt);
+                            }
                             let (is_odd, lat17, lon17) = decode_cpr(me);
                             let frame = CprFrame { lat17, lon17, received_at: now };
                             if is_odd { s.cpr_odd  = Some(frame); }
