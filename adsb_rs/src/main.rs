@@ -407,7 +407,7 @@ fn decoding(
                 if crc & 0xFFFF80 != 0 { continue; }
                 let icao = (result.bytes[1] as u32) << 16 | (result.bytes[2] as u32) << 8 | result.bytes[3] as u32;
                 icao_filter.insert(icao, Instant::now());
-            } else if matches!(df, 0 | 4 | 5 | 16 | 20 | 21 | 24) {
+            } else if matches!(df, 0 | 4 | 5 | 16 | 20 | 21) || df >= 24 {
                 if !icao_filter.contains_key(&crc) { continue; }
             } else {
                 continue;
@@ -418,10 +418,11 @@ fn decoding(
             break;
         }
 
-        // Periodic eviction of stale ICAO entries (prevents unbounded growth in live mode)
+        // Periodic eviction of stale ICAO entries (prevents unbounded growth in live mode).
+        // Note: elapsed() rather than Instant::now() - ICAO_TTL, which panics when the
+        // monotonic clock (time since boot on Linux) is still below the TTL.
         if last_eviction.elapsed() >= ICAO_EVICT_INTERVAL {
-            let cutoff = Instant::now() - ICAO_TTL;
-            icao_filter.retain(|_, seen_at| *seen_at > cutoff);
+            icao_filter.retain(|_, seen_at| seen_at.elapsed() < ICAO_TTL);
             last_eviction = Instant::now();
         }
 

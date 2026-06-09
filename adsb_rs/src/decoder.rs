@@ -70,7 +70,9 @@ pub fn try_decoding(samples: &[u16], trial_phase: u8) -> Option<DecodeResult> {
         df = (df << 1) | bit;
     }
 
-    let payload_length = if VALID_DF_LONG.contains(&df) {
+    // DF 24-31 all begin with bits 11 and are Comm-D (treated as DF24);
+    // only the first 2 bits of the DF field are significant there.
+    let payload_length = if VALID_DF_LONG.contains(&df) || df & 0x18 == 0x18 {
         112
     } else if VALID_DF_SHORT.contains(&df) {
         56
@@ -145,6 +147,8 @@ pub fn decode_altitude(me: &[u8]) -> Option<i32> {
 pub fn decode_velocity(me: &[u8]) -> Option<(f64, f64, i32)> {
     let st = me[0] & 0x07;
     if st != 1 && st != 2 { return None; }
+    // Subtype 2 (supersonic) encodes EW/NS velocity in 4-kt units
+    let unit = if st == 2 { 4.0 } else { 1.0 };
     // Pack 7 ME bytes into u64 for easy bit extraction
     let b = u64::from_be_bytes([0, me[0], me[1], me[2], me[3], me[4], me[5], me[6]]);
     let dir_ew = (b >> 42) & 1;
@@ -154,8 +158,8 @@ pub fn decode_velocity(me: &[u8]) -> Option<(f64, f64, i32)> {
     let vr_sign = (b >> 19) & 1;
     let vr_r    = (b >> 10) & 0x1FF;
     if v_ew_r == 0 || v_ns_r == 0 { return None; }
-    let v_ew = (v_ew_r as f64 - 1.0) * if dir_ew != 0 { -1.0 } else { 1.0 };
-    let v_ns = (v_ns_r as f64 - 1.0) * if dir_ns != 0 { -1.0 } else { 1.0 };
+    let v_ew = (v_ew_r as f64 - 1.0) * unit * if dir_ew != 0 { -1.0 } else { 1.0 };
+    let v_ns = (v_ns_r as f64 - 1.0) * unit * if dir_ns != 0 { -1.0 } else { 1.0 };
     let gs    = (v_ew * v_ew + v_ns * v_ns).sqrt();
     let track = v_ew.atan2(v_ns).to_degrees().rem_euclid(360.0);
     let vert  = if vr_r == 0 { 0i32 }
