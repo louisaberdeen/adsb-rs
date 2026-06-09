@@ -46,10 +46,10 @@ pub fn decode_bits(samples: &[u16], start_offset: usize, phase: u8, num_bits: u8
     let mut bits       = vec![0_u8; num_bits as usize];
     let data_phase     = (phase + 4) % 5;
 
-    for bit_idx in 0..num_bits as usize {
+    for (bit_idx, bit) in bits.iter_mut().enumerate() {
         let sample_offset   = (12 * bit_idx + data_phase as usize) / 5;
         let subsample_phase = ((2 * bit_idx + data_phase as usize) % 5) as u8;
-        bits[bit_idx] = decode_bit_correlation(
+        *bit = decode_bit_correlation(
             samples,
             start_offset + sample_offset,
             subsample_phase,

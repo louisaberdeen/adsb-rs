@@ -306,7 +306,7 @@ fn preamble_detection(
                 let pa_mag = compute_preamble_magnitude(&work_buf, i, phase as u16);
                 if pa_mag > best_mag && pa_mag > ref_level as i32 {
                     best_mag   = pa_mag;
-                    best_phase = phase as i32;
+                    best_phase = phase;
                 }
             }
 
@@ -573,17 +573,15 @@ fn main() {
     let (candidate_tx, candidate_rx) = bounded::<ADSBCandidate>(1024);
     let (decode_tx,    decode_rx)    = bounded::<ADSBMessage>(1024);
 
-    let reader = if config.realtime {
+    let reader: thread::JoinHandle<Result<(), String>> = if config.realtime {
         #[cfg(feature = "sdr")]
-        { thread::spawn(move || soapy_streaming(reader_config, chunk_tx)) }
+        { thread::spawn(move || { soapy_streaming(reader_config, chunk_tx); Ok(()) }) }
         #[cfg(not(feature = "sdr"))]
         { unreachable!() }
     } else {
         thread::spawn(move || {
-            if let Err(e) = read_file(reader_config.clone(), chunk_tx) {
-                eprintln!("error reading file '{}': {e}", reader_config.file_path);
-                std::process::exit(1);
-            }
+            read_file(reader_config.clone(), chunk_tx)
+                .map_err(|e| format!("error reading file '{}': {e}", reader_config.file_path))
         })
     };
 
@@ -605,11 +603,18 @@ fn main() {
     let output_thread =
         thread::spawn(move || output(output_config, output_rx, clients));
 
-    reader.join().unwrap();
+    // Joining the reader returns its result; a read error closes its channel,
+    // so the rest of the pipeline drains and shuts down before we report it.
+    let reader_result = reader.join().unwrap();
     preamble_detector.join().unwrap();
     decoder.join().unwrap();
     if let Some(t) = state_tracker_thread { t.join().unwrap(); }
     output_thread.join().unwrap();
+
+    if let Err(e) = reader_result {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]

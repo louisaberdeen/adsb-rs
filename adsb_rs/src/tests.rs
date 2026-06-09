@@ -200,13 +200,15 @@ fn test_noise_threshold() {
 
 // ─── integration: full pipeline ──────────────────────────────────────────────
 
+const TEST_BIN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../data/modes1_2.4mhz.bin");
+
 #[test]
 fn test_integration_file_decode() {
-    let path = "/home/louis/Documents/ADS-B/data/modes1_2.4mhz.bin";
-    if !std::path::Path::new(path).exists() {
-        println!("skipping: test file not found at {path}");
-        return;
-    }
+    let path = TEST_BIN;
+    assert!(
+        std::path::Path::new(path).exists(),
+        "test file not found at {path}"
+    );
 
     let config = Arc::new(ADSBConfig { file_path: path.to_string(), ..ADSBConfig::default() });
 
@@ -234,14 +236,15 @@ fn test_integration_file_decode() {
 
 #[test]
 fn test_integration_json_output() {
-    let path = "/home/louis/Documents/ADS-B/data/modes1_2.4mhz.bin";
-    if !std::path::Path::new(path).exists() {
-        println!("skipping: test file not found at {path}");
-        return;
-    }
+    let path = TEST_BIN;
+    assert!(
+        std::path::Path::new(path).exists(),
+        "test file not found at {path}"
+    );
 
-    let dir = "/tmp/adsb_rs_test_json";
-    std::fs::create_dir_all(dir).unwrap();
+    let dir = std::env::temp_dir().join(format!("adsb_rs_test_json_{}", std::process::id()));
+    let dir = dir.to_str().unwrap().to_string();
+    std::fs::create_dir_all(&dir).unwrap();
 
     let config = Arc::new(ADSBConfig {
         file_path: path.to_string(),
@@ -281,7 +284,7 @@ fn test_integration_json_output() {
 
     // Every entry must have a 6-character lowercase hex ICAO address
     assert!(
-        aircraft.iter().all(|a| a["hex"].as_str().map_or(false, |h| h.len() == 6)),
+        aircraft.iter().all(|a| a["hex"].as_str().is_some_and(|h| h.len() == 6)),
         "one or more aircraft missing a valid 6-char hex field"
     );
 

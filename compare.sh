@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # compare.sh — compare ADS-B decoder outputs against readsb as truth source
+set -u
 
 BINFILE="data/modes1_2.4mhz.bin"
-PYTHON=".venv/bin/python3"
+PYTHON="${PYTHON:-.venv/bin/python3}"
+RUST_BIN="adsb_rs/target/release/adsb_rs"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -10,44 +12,48 @@ trap 'rm -rf "$TMP"' EXIT
 echo "=== Running decoders on $BINFILE ==="
 
 # --- readsb (truth) ---
+# Use a live readsb if installed, otherwise fall back to the saved reference output
 echo -n "readsb...         "
-readsb --device-type ifile --ifile="$BINFILE" --iformat=UC8 --freq=1090000000 --raw 2>/dev/null \
-    | tee "$TMP/readsb_raw.txt" \
-    | grep -oP '(?<=\*)[0-9a-f]+(?=;)' \
-    | sort -u > "$TMP/readsb.txt"
-READSB_TOTAL=$(wc -l < "$TMP/readsb_raw.txt")
-echo "$READSB_TOTAL raw / $(wc -l < "$TMP/readsb.txt") unique"
+if command -v readsb >/dev/null 2>&1; then
+    readsb --device-type ifile --ifile="$BINFILE" --iformat=UC8 --freq=1090000000 --raw 2>/dev/null \
+        > "$TMP/readsb_raw.txt"
+else
+    echo -n "(using saved data/readsb_output.txt) "
+    cp data/readsb_output.txt "$TMP/readsb_raw.txt"
+fi
+grep -oP '(?<=\*)[0-9a-f]+(?=;)' "$TMP/readsb_raw.txt" | sort -u > "$TMP/readsb.txt"
+echo "$(wc -l < "$TMP/readsb_raw.txt") raw / $(wc -l < "$TMP/readsb.txt") unique"
 
-# --- basic_stream ---
-echo -n "basic_stream...   "
-$PYTHON basic_stream.py 2>/dev/null | tee "$TMP/basic_raw.txt" | \
-    grep -oP '(?<=\*)[0-9a-f]+(?=;)' | sort -u > "$TMP/basic.txt"
-BASIC_TOTAL=$(wc -l < "$TMP/basic_raw.txt")
-echo "$BASIC_TOTAL raw / $(wc -l < "$TMP/basic.txt") unique"
+# --- adsb_rs (Rust) ---
+echo -n "adsb_rs...        "
+if [ ! -x "$RUST_BIN" ]; then
+    echo "building..."
+    (cd adsb_rs && cargo build --release --quiet)
+fi
+"$RUST_BIN" "$BINFILE" 2>/dev/null | tee "$TMP/rust_raw.txt" | \
+    grep -oP '^[0-9a-f]+' | sort -u > "$TMP/rust.txt"
+echo "$(wc -l < "$TMP/rust_raw.txt") raw / $(wc -l < "$TMP/rust.txt") unique"
 
-# --- basic_stream copy ---
-echo -n "basic_stream_copy... "
-$PYTHON "basic_stream copy.py" 2>/dev/null | tee "$TMP/basic_copy_raw.txt" | \
-    grep -oP '(?<=\*)[0-9a-f]+(?=;)' | sort -u > "$TMP/basic_copy.txt"
-BASIC_COPY_TOTAL=$(wc -l < "$TMP/basic_copy_raw.txt")
-echo "$BASIC_COPY_TOTAL raw / $(wc -l < "$TMP/basic_copy.txt") unique"
-
-# --- adsb_24_simple ---
+# --- adsb_24_simple (Python prototype) ---
 echo -n "adsb_24_simple... "
-$PYTHON adsb_24_simple.py 2>/dev/null | tee "$TMP/simple_raw.txt" | \
-    grep -oP '^[0-9a-f]+' | sort -u > "$TMP/simple.txt"
-SIMPLE_TOTAL=$(wc -l < "$TMP/simple_raw.txt")
-echo "$SIMPLE_TOTAL raw / $(wc -l < "$TMP/simple.txt") unique"
+if [ -x "$PYTHON" ]; then
+    "$PYTHON" adsb_24_simple.py 2>/dev/null | tee "$TMP/simple_raw.txt" | \
+        grep -oP '^[0-9a-f]+' | sort -u > "$TMP/simple.txt"
+    echo "$(wc -l < "$TMP/simple_raw.txt") raw / $(wc -l < "$TMP/simple.txt") unique"
+else
+    echo "skipped ($PYTHON not found)"
+    : > "$TMP/simple.txt"
+fi
 
 echo ""
 echo "=== Unique message counts ==="
 printf "  %-22s %s\n" "readsb (truth):"  "$(wc -l < "$TMP/readsb.txt")"
-printf "  %-22s %s\n" "basic_stream:"       "$(wc -l < "$TMP/basic.txt")"
-printf "  %-22s %s\n" "basic_stream_copy:"  "$(wc -l < "$TMP/basic_copy.txt")"
-printf "  %-22s %s\n" "adsb_24_simple:"     "$(wc -l < "$TMP/simple.txt")"
+printf "  %-22s %s\n" "adsb_rs:"         "$(wc -l < "$TMP/rust.txt")"
+printf "  %-22s %s\n" "adsb_24_simple:"  "$(wc -l < "$TMP/simple.txt")"
 
 show_diff() {
     local label="$1" truth="$2" decoder="$3"
+    [ -s "$decoder" ] || return 0
     echo ""
     echo "=== $label vs readsb ==="
     local miss fp
@@ -65,9 +71,8 @@ show_diff() {
     fi
 }
 
-show_diff "basic_stream"      "$TMP/readsb.txt" "$TMP/basic.txt"
-show_diff "basic_stream_copy" "$TMP/readsb.txt" "$TMP/basic_copy.txt"
-show_diff "adsb_24_simple"    "$TMP/readsb.txt" "$TMP/simple.txt"
+show_diff "adsb_rs"        "$TMP/readsb.txt" "$TMP/rust.txt"
+show_diff "adsb_24_simple" "$TMP/readsb.txt" "$TMP/simple.txt"
 
 echo ""
 echo "=== Done ==="
