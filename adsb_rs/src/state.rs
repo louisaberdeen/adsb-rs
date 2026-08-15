@@ -186,17 +186,21 @@ pub fn state_tracker(
                             let cs = decode_callsign(me);
                             if !cs.is_empty() { s.callsign = Some(cs); }
                         }
-                        9..=18 => {
+                        // Airborne position: TC 9-18 carry barometric altitude,
+                        // TC 20-22 carry GNSS altitude; CPR handling is identical
+                        9..=18 | 20..=22 => {
                             // Keep the last good altitude if this frame's is
                             // undecodable (e.g. Gillham-coded, Q=0)
                             if let Some(alt) = decode_altitude(me) {
-                                s.altitude_baro = Some(alt);
+                                if tc <= 18 { s.altitude_baro = Some(alt); }
+                                else        { s.altitude_geom = Some(alt); }
                             }
-                            let (is_odd, lat17, lon17) = decode_cpr(me);
-                            let frame = CprFrame { lat17, lon17, received_at: now };
-                            if is_odd { s.cpr_odd  = Some(frame); }
-                            else      { s.cpr_even = Some(frame); }
-                            try_cpr_decode(s);
+                            if let Some((is_odd, lat17, lon17)) = decode_cpr(me) {
+                                let frame = CprFrame { lat17, lon17, received_at: now };
+                                if is_odd { s.cpr_odd  = Some(frame); }
+                                else      { s.cpr_even = Some(frame); }
+                                try_cpr_decode(s);
+                            }
                         }
                         19 => {
                             if let Some((gs, track, vr)) = decode_velocity(me) {
@@ -204,16 +208,6 @@ pub fn state_tracker(
                                 s.track        = Some(track);
                                 s.vert_rate    = Some(vr);
                             }
-                        }
-                        20..=22 => {
-                            if let Some(alt) = decode_altitude(me) {
-                                s.altitude_geom = Some(alt);
-                            }
-                            let (is_odd, lat17, lon17) = decode_cpr(me);
-                            let frame = CprFrame { lat17, lon17, received_at: now };
-                            if is_odd { s.cpr_odd  = Some(frame); }
-                            else      { s.cpr_even = Some(frame); }
-                            try_cpr_decode(s);
                         }
                         _ => {}
                     }

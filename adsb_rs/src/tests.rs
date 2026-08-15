@@ -1,5 +1,6 @@
 use super::*;
 use crossbeam_channel::bounded;
+use std::collections::HashSet;
 
 // ─── nl() ────────────────────────────────────────────────────────────────────
 
@@ -91,7 +92,7 @@ fn test_decode_cpr_even() {
     // me_u64 = (0x12345 << 17) | 0x6789 = 0x0000_0002_468A_6789
     // → bytes [0, me[0], me[1]…me[6]] = [0, 0x00, 0x00, 0x02, 0x46, 0x8A, 0x67, 0x89]
     let me: Vec<u8> = vec![0x00, 0x00, 0x02, 0x46, 0x8A, 0x67, 0x89];
-    let (is_odd, lat17, lon17) = decode_cpr(&me);
+    let (is_odd, lat17, lon17) = decode_cpr(&me).unwrap();
     assert!(!is_odd);
     assert_eq!(lat17, 0x12345);
     assert_eq!(lon17, 0x6789);
@@ -101,7 +102,7 @@ fn test_decode_cpr_even() {
 fn test_decode_cpr_odd() {
     // F = 1 (odd frame): set bit 34 of me_u64 → adds 0x4_0000_0000 → me[2] += 0x04
     let me: Vec<u8> = vec![0x00, 0x00, 0x06, 0x46, 0x8A, 0x67, 0x89];
-    let (is_odd, lat17, lon17) = decode_cpr(&me);
+    let (is_odd, lat17, lon17) = decode_cpr(&me).unwrap();
     assert!(is_odd);
     assert_eq!(lat17, 0x12345);
     assert_eq!(lon17, 0x6789);
@@ -196,6 +197,86 @@ fn test_noise_threshold() {
     assert_eq!(noise, 1500);
     // ref_level = (1500 * 50) >> 5 = 75000 >> 5 = 2343
     assert_eq!(ref_level, 2343);
+}
+
+// ─── malformed / wrong-type input ────────────────────────────────────────────
+
+#[test]
+fn test_decoders_reject_short_input() {
+    // Every public decode function must handle a truncated ME field
+    // (fewer than the required 7 bytes) without panicking
+    for me in [&[][..], &[0x99][..], &[0x99, 0x01, 0x2D][..]] {
+        assert_eq!(decode_callsign(me), "");
+        assert_eq!(decode_altitude(me), None);
+        assert_eq!(decode_velocity(me), None);
+        assert_eq!(decode_cpr(me), None);
+    }
+}
+
+#[test]
+fn test_modes_checksum_short_input_is_invalid() {
+    // A frame shorter than 7 bytes can never be valid; the checksum must
+    // report it as invalid (non-zero) rather than panic
+    for msg in [&[][..], &[0x8f][..], &[0x8f, 0x4d, 0x20, 0x23, 0x58, 0x7f][..]] {
+        assert_ne!(modes_checksum(msg), 0);
+        assert_ne!(modes_checksum(msg) & 0xFFFF80, 0);
+    }
+}
+
+#[test]
+fn test_decode_bits_beyond_buffer_no_panic() {
+    // Asking for more bits than the sample buffer holds must not panic
+    let samples = vec![0u16; 10];
+    let bits = decode_bits(&samples, 0, 0, 112);
+    assert_eq!(bits.len(), 112);
+}
+
+#[test]
+fn test_pipeline_non_iq_input_decodes_nothing() {
+    // A text file fed as IQ data must flow through the whole pipeline
+    // without panicking and produce zero decoded messages
+    let path = std::env::temp_dir().join(format!("adsb_rs_not_iq_{}.bin", std::process::id()));
+    std::fs::write(&path, "definitely not IQ samples\n".repeat(8192)).unwrap();
+
+    let config = Arc::new(ADSBConfig {
+        file_path: path.to_str().unwrap().to_string(),
+        ..ADSBConfig::default()
+    });
+
+    let (chunk_tx,     chunk_rx)     = bounded::<SampleChunk>(4);
+    let (candidate_tx, candidate_rx) = bounded::<ADSBCandidate>(1024);
+    let (decode_tx,    decode_rx)    = bounded::<ADSBMessage>(1024);
+
+    let cfg = Arc::clone(&config);
+    let reader   = thread::spawn(move || read_file(cfg, chunk_tx).unwrap());
+    let cfg = Arc::clone(&config);
+    let detector = thread::spawn(move || preamble_detection(cfg, chunk_rx, candidate_tx));
+    let cfg = Arc::clone(&config);
+    let decoder  = thread::spawn(move || decoding(cfg, candidate_rx, decode_tx));
+
+    reader.join().unwrap();
+    detector.join().unwrap();
+    decoder.join().unwrap();
+
+    assert_eq!(decode_rx.try_iter().count(), 0, "text input must decode zero messages");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn test_read_file_empty_input() {
+    // An empty file must terminate cleanly with no chunks sent
+    let path = std::env::temp_dir().join(format!("adsb_rs_empty_{}.bin", std::process::id()));
+    std::fs::write(&path, b"").unwrap();
+
+    let config = Arc::new(ADSBConfig {
+        file_path: path.to_str().unwrap().to_string(),
+        ..ADSBConfig::default()
+    });
+
+    let (chunk_tx, chunk_rx) = bounded::<SampleChunk>(4);
+    read_file(config, chunk_tx).unwrap();
+    assert_eq!(chunk_rx.try_iter().count(), 0);
+    std::fs::remove_file(&path).ok();
 }
 
 // ─── integration: full pipeline ──────────────────────────────────────────────

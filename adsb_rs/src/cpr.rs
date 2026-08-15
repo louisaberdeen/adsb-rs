@@ -71,7 +71,8 @@ pub fn nl(lat: f64) -> u32 {
     1
 }
 
-pub fn decode_cpr(me: &[u8]) -> (bool, u32, u32) {
+pub fn decode_cpr(me: &[u8]) -> Option<(bool, u32, u32)> {
+    if me.len() < 7 { return None; }
     // ME bit N (0-indexed from MSB of 56-bit field) sits at u64 bit (55 - N).
     // F flag  = ME bit 21  →  u64 bit 34
     // lat17   = ME bits 22-38  →  u64 bits 33-17  →  (me_u64 >> 17) & 0x1FFFF
@@ -80,7 +81,7 @@ pub fn decode_cpr(me: &[u8]) -> (bool, u32, u32) {
     let f_bit  = ((me_u64 >> 34) & 1) != 0;
     let lat17  = ((me_u64 >> 17) & 0x1FFFF) as u32;
     let lon17  = (me_u64 & 0x1FFFF) as u32;
-    (f_bit, lat17, lon17)
+    Some((f_bit, lat17, lon17))
 }
 
 pub fn cpr_global_decode(

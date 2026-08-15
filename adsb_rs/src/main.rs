@@ -9,7 +9,6 @@ pub use decoder::{
     decode_callsign, decode_altitude, decode_velocity,
 };
 pub use state::state_tracker;
-pub use std::collections::HashSet;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -57,7 +56,7 @@ struct Cli {
     no_nms: bool,
 
     /// Loop file input continuously (useful with --serve for persistent testing)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "live")]
     r#loop: bool,
 
     /// List available SoapySDR devices and exit (requires --features sdr)
@@ -142,6 +141,7 @@ fn read_file(
     // A short read can return an odd byte count; carry the dangling I byte
     // so I/Q pairing stays aligned across reads.
     let mut leftover: Option<u8> = None;
+    let mut total_read = 0usize;
 
     loop {
         let offset = match leftover.take() {
@@ -150,12 +150,26 @@ fn read_file(
         };
         let n = reader.read(&mut chunk[offset..])?;
         if n == 0 {
-            if config.loop_file {
+            // Never rewind an empty file: --loop would busy-loop forever
+            if config.loop_file && total_read > 0 {
                 reader.seek(io::SeekFrom::Start(0))?;
                 continue;
             }
             break;
         }
+
+        // Sniff common container formats on the first read so a wrong file type
+        // produces a warning instead of silent zero decodes
+        if total_read == 0 && n >= 4 {
+            let magic = &chunk[..4];
+            if magic == b"RIFF" {
+                eprintln!("warning: '{}' starts with a RIFF/WAV header — expected raw UC8 IQ; \
+                           export the recording as raw 8-bit unsigned I/Q instead", config.file_path);
+            } else if magic[..2] == [0x1f, 0x8b] {
+                eprintln!("warning: '{}' is gzip-compressed — decompress it first", config.file_path);
+            }
+        }
+        total_read += n;
 
         let total = offset + n;
         if total % 2 == 1 {
@@ -174,6 +188,9 @@ fn read_file(
         {
             break;
         }
+    }
+    if total_read == 0 {
+        eprintln!("warning: '{}' is empty — nothing to decode", config.file_path);
     }
     Ok(())
 }
@@ -237,6 +254,8 @@ struct ADSBCandidate {
 }
 
 fn compute_noise_and_threshold(samples: &[u16], idx: usize, threshold_factor: u16) -> (u32, u32) {
+    // Out-of-range window: return an impossible threshold so no candidate passes
+    if idx + 19 > samples.len() { return (0, u32::MAX); }
     let noise: u32 = samples[idx + 5]  as u32
         + samples[idx + 8]  as u32
         + samples[idx + 16] as u32
@@ -453,7 +472,9 @@ fn output(
     rx:      crossbeam_channel::Receiver<ADSBMessage>,
     clients: Arc<Mutex<Vec<std::net::TcpStream>>>,
 ) {
+    let mut message_count = 0u64;
     while let Ok(msg) = rx.recv() {
+        message_count += 1;
         let hex: String = msg.bytes[..msg.len as usize]
             .iter()
             .map(|b| format!("{:02x}", b))
@@ -479,6 +500,10 @@ fn output(
                 println!("{hex}");
             }
         }
+    }
+    if message_count == 0 && !config.realtime {
+        eprintln!("no messages decoded — check the input is raw UC8 IQ sampled at 2.4 MHz \
+                   (e.g. rtl_sdr -f 1090000000 -s 2400000 out.bin)");
     }
 }
 
@@ -514,6 +539,20 @@ fn main() {
         std::process::exit(1);
     }
 
+    if !cli.rate.is_finite() || cli.rate <= 0.0 {
+        eprintln!("error: --rate must be a positive number of Hz, got {}", cli.rate);
+        std::process::exit(1);
+    }
+    // The demodulator's correlation kernels assume 2.4 samples/bit; other
+    // rates run but decode nothing, so say so up front
+    if (cli.rate - 2_400_000.0).abs() > 1.0 {
+        eprintln!("warning: demodulator is tuned for 2.4 MHz sampling; \
+                   {} Hz will likely decode no messages", cli.rate);
+    }
+    if cli.live && (cli.freq - 1_090_000_000.0).abs() > 1.0 {
+        eprintln!("warning: ADS-B is transmitted at 1090 MHz; tuning to {} Hz", cli.freq);
+    }
+
     // --live without the sdr feature compiled in: bail with a clear message
     #[cfg(not(feature = "sdr"))]
     if cli.live {
@@ -538,6 +577,14 @@ fn main() {
         quiet:            cli.quiet,
         ..ADSBConfig::default()
     });
+
+    // Fail fast on an unusable --json directory instead of logging every second
+    if let Some(dir) = &config.json_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("error: cannot create --json directory '{dir}': {e}");
+            std::process::exit(1);
+        }
+    }
 
     // Shared list of connected TCP clients for AVR broadcast
     let clients: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));

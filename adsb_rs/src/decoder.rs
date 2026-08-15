@@ -18,7 +18,7 @@ pub struct DecodeResult {
 }
 
 pub fn decode_bit_correlation(samples: &[u16], sample_offset: usize, subsample_phase: u8) -> u8 {
-    let window = &samples[sample_offset..];
+    let Some(window) = samples.get(sample_offset..) else { return 0 };
     if window.len() < 3 { return 0; }
 
     let s0 = window[0] as i32;
@@ -96,6 +96,9 @@ pub const POLY: u32 = 0xFFF409;
 pub fn modes_checksum(msg: &[u8]) -> u32 {
     let mut crc: u32 = 0;
     let n = msg.len();
+    // A Mode S frame is at least 7 bytes (56 bits); anything shorter can
+    // never checksum as valid, so report it as such instead of panicking
+    if n < 7 { return 0xFFFFFF; }
 
     for &byte in &msg[..n - 3] {
         crc ^= (byte as u32) << 16;
@@ -113,6 +116,7 @@ pub fn modes_checksum(msg: &[u8]) -> u32 {
 }
 
 pub fn decode_callsign(me: &[u8]) -> String {
+    if me.len() < 7 { return String::new(); }
     let bits = u64::from_be_bytes([0, 0, me[1], me[2], me[3], me[4], me[5], me[6]]);
     let mut cs = String::with_capacity(8);
     for i in (0..8).rev() {
@@ -127,6 +131,7 @@ pub fn decode_callsign(me: &[u8]) -> String {
 }
 
 pub fn decode_altitude(me: &[u8]) -> Option<i32> {
+    if me.len() < 7 { return None; }
     // Pack ME into a u64 (with a leading zero byte) so we can extract bits by position.
     // ME bit N (0-indexed from MSB of 56-bit field) sits at u64 bit (55 - N).
     // Altitude field = ME bits 8-19  →  u64 bits 47-36  →  (me_u64 >> 36) & 0xFFF
@@ -145,6 +150,7 @@ pub fn decode_altitude(me: &[u8]) -> Option<i32> {
 }
 
 pub fn decode_velocity(me: &[u8]) -> Option<(f64, f64, i32)> {
+    if me.len() < 7 { return None; }
     let st = me[0] & 0x07;
     if st != 1 && st != 2 { return None; }
     // Subtype 2 (supersonic) encodes EW/NS velocity in 4-kt units
